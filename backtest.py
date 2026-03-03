@@ -1,13 +1,7 @@
-"""
-Bitcoin Prediction Market — Mid-Price Momentum Scalp Backtest v2
-=================================================================
-Key changes from v1:
-  - Vectorized signal generation (100x faster — seconds not minutes)
-  - Relaxed liquidity filter: signals fire when at least one side present
-  - Robust mid-price estimation for one-sided markets
-  - mean_edge KeyError fix
-  - Diagnostic report added to explain signal counts before sweep
-"""
+# ─────────────────────────────────────────────
+# BTC/ETH/SOL/XRP Prediction Market — Momentum Signal Backtest
+# OBFUSCATED VERSION
+# ─────────────────────────────────────────────
 
 import math
 import itertools
@@ -44,10 +38,9 @@ def kelly_fraction(q: float, p: float) -> float:
     return (q * (1 - p) - (1 - q) * p) / (p * (1 - p))
 
 
-MAX_KELLY_FRACTION = 0.25  # hard cap: never risk more than 25% of bankroll on one trade
+MAX_KELLY_FRACTION = 0.25  
 
 def contracts_from_kelly(f, kelly_mult, bankroll, entry_price):
-    # Cap the effective fraction to avoid catastrophic oversizing at extreme prices
     effective_f = min(f * kelly_mult, MAX_KELLY_FRACTION)
     stake = effective_f * bankroll
     if stake <= 0 or entry_price <= 0:
@@ -56,115 +49,15 @@ def contracts_from_kelly(f, kelly_mult, bankroll, entry_price):
 
 
 # ─────────────────────────────────────────────
-# 3. PREPROCESSING
+# 3. PREPROCESSING - OBFUSCATED 
 # ─────────────────────────────────────────────
 
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # Drop rows where ALL bid/qty columns are NaN (post-resolution noise)
-    bid_cols = ["yes_best_bid_dollars", "yes_best_bid_qty",
-                "no_best_bid_dollars",  "no_best_bid_qty"]
-    df = df.dropna(subset=bid_cols, how="all")
-
-    df["fetched_at"] = pd.to_datetime(df["fetched_at"])
-    df = df.sort_values(["market_ticker", "fetched_at"]).reset_index(drop=True)
-
-    # Keep only complete chains (11–15 min duration)
-    durations = df.groupby("market_ticker")["fetched_at"].agg(["min", "max"])
-    durations["dur_min"] = (durations["max"] - durations["min"]).dt.total_seconds() / 60
-    valid = durations[(durations["dur_min"] >= 11) & (durations["dur_min"] <= 15)].index
-    df = df[df["market_ticker"].isin(valid)].copy()
-
-    # Recompute target label
-    def compute_label(g):
-        """
-        Use final orderbook state to determine resolution — not median.
-        The last snapshot before NaN flood is ground truth:
-          - YES-only bids > 0.85 at end  → resolved YES
-          - NO-only bids  > 0.85 at end  → resolved NO
-          - Both sides present at end    → use last mid
-          - Fallback                     → median (original logic)
-        """
-        g = g.copy().sort_values("fetched_at")
-        y_all = g["yes_best_bid_dollars"]
-        n_all = g["no_best_bid_dollars"]
-
-        last_valid = g[y_all.notna() | n_all.notna()]
-        if len(last_valid) > 0:
-            last    = last_valid.iloc[-1]
-            yes_end = last["yes_best_bid_dollars"]
-            no_end  = last["no_best_bid_dollars"]
-
-            # One-sided final state → unambiguous resolution
-            if pd.notna(yes_end) and pd.isna(no_end) and yes_end > 0.85:
-                g["target"] = 1.0
-                return g
-            if pd.notna(no_end) and pd.isna(yes_end) and no_end > 0.85:
-                g["target"] = 0.0
-                return g
-
-            # Both sides still present → use last mid
-            if pd.notna(yes_end) and pd.notna(no_end):
-                last_mid = (yes_end + (1 - no_end)) / 2
-                g["target"] = 1.0 if last_mid > 0.5 else 0.0
-                return g
-
-        # Fallback: median
-        y  = y_all.dropna()
-        n  = n_all.dropna()
-        ym = y.median() if len(y) > 0 else 0
-        nm = n.median() if len(n) > 0 else 0
-        g["target"] = 1.0 if ym > nm else 0.0
-        return g
-    df = df.groupby("market_ticker", group_keys=False).apply(compute_label)
-
-    # Liquidity flags
-    df["yes_bid_present"] = df["yes_best_bid_dollars"].notna().astype(int)
-    df["no_bid_present"]  = df["no_best_bid_dollars"].notna().astype(int)
-    df["two_sided"]       = (df["yes_bid_present"] & df["no_bid_present"]).astype(int)
-
-    # Implied asks
-    df["yes_ask"] = 1 - df["no_best_bid_dollars"]
-    df["no_ask"]  = 1 - df["yes_best_bid_dollars"]
-
-    # Mid price — robust to one-sided markets:
-    #   two-sided:  standard (yes_bid + yes_ask) / 2
-    #   only YES:   yes_bid as lower bound proxy (conservative — mid = yes_bid)
-    #   only NO:    no_bid as upper bound proxy  (mid = 1 - no_bid)
-    df["mid_recomputed"] = np.nan
-
-    two   = df["two_sided"] == 1
-    yes_only = (df["yes_bid_present"] == 1) & (df["no_bid_present"] == 0)
-    no_only  = (df["yes_bid_present"] == 0) & (df["no_bid_present"] == 1)
-
-    df.loc[two,      "mid_recomputed"] = (df.loc[two, "yes_best_bid_dollars"] + df.loc[two, "yes_ask"]) / 2
-    df.loc[yes_only, "mid_recomputed"] = df.loc[yes_only, "yes_best_bid_dollars"]
-    df.loc[no_only,  "mid_recomputed"] = 1 - df.loc[no_only, "no_best_bid_dollars"]
-
-    df["spread_recomputed"] = np.nan
-    df.loc[two, "spread_recomputed"] = df.loc[two, "yes_ask"] - df.loc[two, "yes_best_bid_dollars"]
-
-    # Crossed book flag
-    df["crossed_book"] = (two & (df["yes_best_bid_dollars"] + df["no_best_bid_dollars"] > 1.0)).astype(int)
-
-    # Snapshot index
-    df["snapshot_idx"] = df.groupby("market_ticker").cumcount()
-    df["chain_length"] = df.groupby("market_ticker")["snapshot_idx"].transform("max") + 1
-
-    # Chain start hour in Eastern time (for hour-of-day filter)
-    chain_start = df.groupby("market_ticker")["fetched_at"].transform("min")
-    try:
-        df["chain_hour"] = chain_start.dt.tz_localize("UTC").dt.tz_convert("US/Eastern").dt.hour
-    except TypeError:
-        # Already timezone-aware
-        df["chain_hour"] = chain_start.dt.tz_convert("US/Eastern").dt.hour
-
     return df
 
 
 # ─────────────────────────────────────────────
-# 4. DIAGNOSTIC REPORT
+# 4. DIAGNOSTIC REPORT - MOMENTUM SIGNAL OBFUSCATED
 # ─────────────────────────────────────────────
 
 def diagnostic_report(df: pd.DataFrame):
@@ -195,7 +88,7 @@ def diagnostic_report(df: pd.DataFrame):
     print(f"    NO only    : {n_only:>7,}  ({100*n_only/n:.1f}%)")
     print(f"    Neither    : {none:>7,}  ({100*none/n:.1f}%)")
 
-    # Mid price distribution (where available)
+    # Mid price distribution
     mid_valid = df["mid_recomputed"].dropna()
     print(f"\n  Mid price stats (n={len(mid_valid):,}):")
     print(f"    {mid_valid.describe().round(3).to_string()}")
@@ -204,110 +97,17 @@ def diagnostic_report(df: pd.DataFrame):
     targets = df.groupby("market_ticker")["target"].first()
     print(f"\n  Target balance: YES={targets.mean():.1%}  NO={(1-targets.mean()):.1%}")
 
-    # Momentum breach rates — key for calibrating thresholds
-    df_mom = df.copy()
-    df_mom["mom_k1"] = df_mom.groupby("market_ticker")["mid_recomputed"].diff(1)
-    tradeable = df_mom["mid_recomputed"].between(0.15, 0.85)
-    conviction = (df_mom["mid_recomputed"] > 0.60) | (df_mom["mid_recomputed"] < 0.40)
-    tradeable_conv = tradeable & conviction
-    n_trade = tradeable.sum()
-    n_conv  = tradeable_conv.sum()
-    print(f"\n  Conviction zone rows (mid<0.40 or mid>0.60): {n_conv:,} / {n_trade:,} tradeable ({100*n_conv/n_trade:.1f}%)")
-    print(f"\n  Momentum breach rates (k=1, mid in [0.15,0.85], n={n_trade:,}):")
-    for thr in [0.005, 0.01, 0.02, 0.03, 0.05, 0.08, 0.10]:
-        breach_all  = df_mom.loc[tradeable,      "mom_k1"].abs() > thr
-        breach_conv = df_mom.loc[tradeable_conv, "mom_k1"].abs() > thr
-        print(f"    thr={thr:.3f}: all={breach_all.sum():>6,}  conviction_zone={breach_conv.sum():>6,}")
+    # Momentum signal rates - OBFUSCATED
     print("────────────────────────────────────────────────────────────\n")
 
 
 
 # ─────────────────────────────────────────────
-# 5. VECTORIZED SIGNAL GENERATION
+# 5. VECTORIZED SIGNAL GENERATION - OBFUSCATED
 # ─────────────────────────────────────────────
 
 def generate_signals_vectorized(df: pd.DataFrame, k: int, threshold: float,
                                  entry_window: tuple) -> pd.DataFrame:
-    """
-    Vectorized momentum signal generation — ~100x faster than row-loop version.
-    Uses pandas groupby + shift to compute momentum across all chains at once.
-    """
-    df = df.copy()
-    win_start, win_end = entry_window
-
-    # Compute lagged mid within each chain
-    df["mid_lag"] = df.groupby("market_ticker")["mid_recomputed"].shift(k)
-
-    # Momentum
-    df["momentum"] = df["mid_recomputed"] - df["mid_lag"]
-
-    # Entry window filter — convert negative win_end to absolute index
-    df["win_end_abs"] = df["chain_length"] - 1 + win_end  # win_end is negative e.g. -2
-    in_window = (df["snapshot_idx"] >= win_start) & (df["snapshot_idx"] <= df["win_end_abs"])
-
-    # Final-minute exclusion: ~23 snapshots @ 2.6s = 60s
-    # Skip any snapshot within the last minute of the chain
-    FINAL_MIN_SNAPSHOTS = 23
-    not_final_minute = (
-        df["snapshot_idx"] <= (df["chain_length"] - 1 - FINAL_MIN_SNAPSHOTS)
-    )
-
-    # Market phase filter: skip 30-40% through chain (weak win rate historically)
-    pct_through = df["snapshot_idx"] / df["chain_length"]
-    not_dead_zone = ~pct_through.between(0.30, 0.40)
-
-    # Entry zone: [0.70, 0.85] for YES, [0.15, 0.30] for NO (mirrored)
-    in_yes_zone   = df["mid_recomputed"].between(0.75, 0.85)
-    in_no_zone    = df["mid_recomputed"].between(0.15, 0.25)
-    in_entry_zone = in_yes_zone | in_no_zone
-
-    # Hour-of-day filter: skip hours 8, 9, 15, 16 EST (high volatility windows)
-    BLOCKED_HOURS = {8, 9, 15, 16}
-    if "chain_hour" in df.columns:
-        not_blocked_hour = ~df["chain_hour"].isin(BLOCKED_HOURS)
-    else:
-        not_blocked_hour = pd.Series(True, index=df.index)
-
-    # Valid rows: in entry zone, not crossed, mid available,
-    #             not blocked hour, not final minute, not dead zone
-    valid = (
-        in_window &
-        (df["crossed_book"] == 0) &
-        df["mid_recomputed"].notna() &
-        df["mid_lag"].notna() &
-        in_entry_zone &
-        not_blocked_hour &
-        not_final_minute &
-        not_dead_zone
-    )
-
-    # Signals
-    df["signal"]      = 0
-    df["entry_price"] = np.nan
-    df["estimated_q"] = np.nan
-
-    # YES signal: mid in [0.70, 0.85] AND positive momentum
-    # NO signal:  mid in [0.15, 0.30] AND negative momentum
-    buy_yes = valid & in_yes_zone & (df["momentum"] >  threshold)
-    buy_no  = valid & in_no_zone  & (df["momentum"] < -threshold)
-
-    # For YES entries: need a yes_ask (requires no_bid present)
-    # For NO entries:  need a no_ask  (requires yes_bid present)
-    # Fall back: if only one side present, use what we have
-    df.loc[buy_yes, "signal"]      = +1
-    df.loc[buy_yes, "entry_price"] = df.loc[buy_yes, "yes_ask"].fillna(
-        1 - df.loc[buy_yes, "mid_recomputed"]  # fallback if no_bid absent
-    )
-    df.loc[buy_yes, "estimated_q"] = df.loc[buy_yes, "mid_recomputed"]
-
-    df.loc[buy_no, "signal"]      = -1
-    df.loc[buy_no, "entry_price"] = df.loc[buy_no, "no_ask"].fillna(
-        df.loc[buy_no, "mid_recomputed"]        # fallback if yes_bid absent
-    )
-    df.loc[buy_no, "estimated_q"] = 1 - df.loc[buy_no, "mid_recomputed"]
-
-    # Drop helper columns
-    df = df.drop(columns=["mid_lag", "win_end_abs"])
     return df
 
 
@@ -438,7 +238,7 @@ def run_backtest(df: pd.DataFrame, k: int, threshold: float,
                  max_contracts: int = 9999,
                  max_sizing_bankroll: float = np.inf) -> dict:
 
-    # Vectorized signal generation (fast)
+    # Signal generation
     df_sig = generate_signals_vectorized(df, k, threshold, entry_window)
 
     bankroll   = initial_bankroll
@@ -491,7 +291,6 @@ def run_backtest(df: pd.DataFrame, k: int, threshold: float,
 # ─────────────────────────────────────────────
 
 def parameter_sweep(df: pd.DataFrame, initial_bankroll: float = 1000.0) -> pd.DataFrame:
-    # Fixed optimal params — sweep light variations around the known best
     ks                   = [2, 3]
     thresholds           = [0.02, 0.03, 0.05]
     kelly_multipliers    = {"5pct": 0.05, "10pct": 0.10}
@@ -546,7 +345,7 @@ def kelly_calibration(trades_df: pd.DataFrame, bins: int = 5) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────
-# 10. VISUALISATION
+# 10. VISUALIZATION
 # ─────────────────────────────────────────────
 
 def plot_results(best_result: dict, sweep_summary: pd.DataFrame, out_path: str):
@@ -618,12 +417,7 @@ def plot_results(best_result: dict, sweep_summary: pd.DataFrame, out_path: str):
 
 
 # ─────────────────────────────────────────────
-# 11. MAIN
-# ─────────────────────────────────────────────
-
-
-# ─────────────────────────────────────────────
-# WALK-FORWARD VALIDATION
+# 11. MAIN WALK-FORWARD VALIDATION
 # ─────────────────────────────────────────────
 
 def walk_forward_validation(
@@ -633,12 +427,7 @@ def walk_forward_validation(
     initial_bankroll: float = 1000.0,
 ) -> dict:
     """
-    Chronological train/test split using FIXED params from the full-dataset sweep.
-
-    Deliberately avoids re-optimizing on the train split — that approach
-    finds lucky configurations on small samples and produces misleading
-    overfitting signals. Instead we fix the full-dataset best params and
-    simply ask: do they work on unseen future chains?
+    Chronological train/test split using FIXED params from the full-dataset parameter sweep.
 
     Parameters
     ----------
@@ -763,7 +552,7 @@ def main(csv_path: str, initial_bankroll: float = 1000.0):
           f"{df['market_ticker'].nunique():,} chains | "
           f"avg chain length: {df.groupby('market_ticker').size().mean():.1f} snapshots")
 
-    # Always run diagnostic first — explains signal behaviour
+    # Always run diagnostic first
     diagnostic_report(df)
 
     print("Running parameter sweep...")
